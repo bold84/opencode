@@ -73,6 +73,33 @@ export namespace McpOAuthCallback {
       port: OAUTH_CALLBACK_PORT,
       fetch(req) {
         const url = new URL(req.url)
+        const host = req.headers.get("host") ?? req.headers.get("Host") ?? ""
+        const origin = req.headers.get("origin") ?? req.headers.get("Origin") ?? null
+
+        // Validate Host header: must be localhost:port for the callback
+        const expectedHost = `127.0.0.1:${OAUTH_CALLBACK_PORT}`
+        const altHost = `localhost:${OAUTH_CALLBACK_PORT}`
+        if (host && host !== expectedHost && host !== altHost) {
+          log.error("oauth callback rejected: invalid host header", { host, expectedHost, altHost })
+          return new Response(HTML_ERROR("Invalid host header - potential request forgery"), {
+            status: 400,
+            headers: { "Content-Type": "text/html" },
+          })
+        }
+
+        // Validate Origin header when present: must be null or localhost
+        if (
+          origin &&
+          !origin.startsWith("http://127.0.0.1:") &&
+          !origin.startsWith("http://localhost:") &&
+          origin !== "null"
+        ) {
+          log.error("oauth callback rejected: invalid origin header", { origin })
+          return new Response(HTML_ERROR("Invalid origin header - potential cross-site request"), {
+            status: 400,
+            headers: { "Content-Type": "text/html" },
+          })
+        }
 
         if (url.pathname !== OAUTH_CALLBACK_PATH) {
           return new Response("Not found", { status: 404 })
@@ -83,7 +110,7 @@ export namespace McpOAuthCallback {
         const error = url.searchParams.get("error")
         const errorDescription = url.searchParams.get("error_description")
 
-        log.info("received oauth callback", { hasCode: !!code, state, error })
+        log.info("received oauth callback", { hasCode: !!code, state, error, host, origin })
 
         // Enforce state parameter presence
         if (!state) {

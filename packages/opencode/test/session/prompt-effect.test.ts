@@ -1,5 +1,5 @@
 import { NodeFileSystem } from "@effect/platform-node"
-import { expect, spyOn } from "bun:test"
+import { beforeEach, expect, spyOn } from "bun:test"
 import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import path from "path"
 import z from "zod"
@@ -44,6 +44,14 @@ const ref = {
   providerID: ProviderID.make("test"),
   modelID: ModelID.make("test-model"),
 }
+
+const mcpCatalogRef: { current: MCP.CatalogEntry[] } = { current: [] }
+const mcpLazyRef: { current: Record<string, any> } = { current: {} }
+
+beforeEach(() => {
+  mcpCatalogRef.current = []
+  mcpLazyRef.current = {}
+})
 
 function defer<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void
@@ -96,6 +104,9 @@ const mcp = Layer.succeed(
     status: () => Effect.succeed({}),
     clients: () => Effect.succeed({}),
     tools: () => Effect.succeed({}),
+    catalog: () => Effect.succeed(mcpCatalogRef.current),
+    toolsWithLazy: (active) =>
+      Effect.succeed(Object.fromEntries(Object.entries(mcpLazyRef.current).filter(([key]) => active.has(key)))),
     prompts: () => Effect.succeed({}),
     resources: () => Effect.succeed({}),
     add: () => Effect.succeed({ status: { status: "disabled" as const } }),
@@ -1238,4 +1249,97 @@ unix(
       ),
     ),
   30_000,
+)
+
+it.live("tracks MCP activation per session and clears on cancel", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const a = yield* sessions.create({ title: "A" })
+      const b = yield* sessions.create({ title: "B" })
+
+      expect(yield* prompt.activeMcpTools(a.id)).toEqual([])
+      yield* prompt.activateMcpTools(a.id, ["github_issue", "github_issue"])
+      expect(yield* prompt.activeMcpTools(a.id)).toEqual(["github_issue"])
+      expect(yield* prompt.activeMcpTools(b.id)).toEqual([])
+
+      yield* prompt.cancel(a.id)
+      expect(yield* prompt.activeMcpTools(a.id)).toEqual([])
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
+it.live("tracks MCP meta-tool rate limits per session and clears on cancel", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const a = yield* sessions.create({ title: "rate" })
+      const b = yield* sessions.create({ title: "other" })
+
+      for (let i = 0; i < 30; i++) {
+        expect(yield* prompt.consumeMcpRate(a.id, "search")).toBe(true)
+      }
+      expect(yield* prompt.consumeMcpRate(a.id, "search")).toBe(false)
+      expect(yield* prompt.consumeMcpRate(b.id, "search")).toBe(true)
+
+      yield* prompt.cancel(a.id)
+      expect(yield* prompt.consumeMcpRate(a.id, "search")).toBe(true)
+    }),
+    { git: true, config: providerCfg },
+  ),
+)
+
+it.live("mcp tool loads a lazy MCP tool for the session", () =>
+  provideTmpdirServer(
+    Effect.fnUntraced(function* ({ llm }) {
+      mcpCatalogRef.current = [
+        {
+          server: "github",
+          toolName: "issue",
+          toolId: "github_issue",
+          description: "Create an issue",
+          loaded: false,
+        },
+      ]
+      mcpLazyRef.current = {
+        github_issue: {
+          description: "Create an issue",
+          inputSchema: z.object({}),
+          execute: async () => ({ content: [{ type: "text", text: "lazy ok" }], metadata: {} }),
+        },
+      }
+
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const chat = yield* sessions.create({
+        title: "Pinned",
+        permission: [{ permission: "*", pattern: "*", action: "allow" }],
+      })
+      yield* prompt.prompt({
+        sessionID: chat.id,
+        agent: "build",
+        noReply: true,
+        parts: [{ type: "text", text: "open a lazy github issue" }],
+      })
+
+      yield* llm.push(
+        reply()
+          .tool("mcp", { action: "load", tools: [{ server: "github", name: "issue" }] })
+          .stop(),
+      )
+      yield* llm.push(reply().tool("github_issue", {}).stop())
+      yield* llm.text("done")
+
+      const result = yield* prompt.loop({ sessionID: chat.id })
+      expect(result.parts.some((part) => part.type === "text" && part.text === "done")).toBe(true)
+      expect(yield* prompt.activeMcpTools(chat.id)).toEqual(["github_issue"])
+
+      mcpCatalogRef.current = []
+      mcpLazyRef.current = {}
+    }),
+    { git: true, config: providerCfg },
+  ),
 )

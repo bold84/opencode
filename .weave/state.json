@@ -1,0 +1,13 @@
+{
+  "active_plan": "/Users/ben/Development/bold84/opencode/.weave/plans/lazy-mcp-loading.md",
+  "started_at": "2026-04-05T20:05:01.325Z",
+  "session_ids": [
+    "ses_2a0ee6891ffeJ6l51l53e4dleO"
+  ],
+  "plan_name": "lazy-mcp-loading",
+  "agent": "tapestry",
+  "start_sha": "8b48d653ddc99a9de9ff6bc23b8cad8ae6b6b946",
+  "continuation_completed_snapshot": 22,
+  "stale_continuation_count": 0,
+  "paused": true
+}

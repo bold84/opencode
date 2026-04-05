@@ -1765,6 +1765,24 @@ test("local .opencode config can override MCP from project config", async () => 
   })
 })
 
+test("resolveMcpMode preserves explicit mode and warns on enabled conflict", () => {
+  const warn = spyOn(console, "warn").mockImplementation(() => {})
+  expect(
+    Config.resolveMcpMode(
+      {
+        type: "remote",
+        url: "https://jira.example.com/mcp",
+        mode: "lazy",
+        enabled: false,
+      },
+      "jira",
+    ),
+  ).toBe("lazy")
+  expect(warn).toHaveBeenCalledTimes(1)
+  expect(warn.mock.calls[0]?.[0]).toContain("jira")
+  warn.mockRestore()
+})
+
 test("project config overrides remote well-known config", async () => {
   const originalFetch = globalThis.fetch
   let fetchedUrl: string | undefined

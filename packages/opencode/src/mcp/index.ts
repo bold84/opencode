@@ -30,6 +30,8 @@ import { makeRuntime } from "@/effect/run-service"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
 
+const STARTUP_CONCURRENCY = 10
+
 export namespace MCP {
   const log = Log.create({ service: "mcp" })
   const DEFAULT_TIMEOUT = 30_000
@@ -210,12 +212,23 @@ export namespace MCP {
     status: Record<string, Status>
     clients: Record<string, MCPClient>
     defs: Record<string, MCPToolDef[]>
+    modes: Record<string, "eager" | "lazy" | "disabled">
+  }
+
+  export interface CatalogEntry {
+    server: string
+    toolName: string
+    toolId: string
+    description: string
+    loaded: boolean
   }
 
   export interface Interface {
     readonly status: () => Effect.Effect<Record<string, Status>>
     readonly clients: () => Effect.Effect<Record<string, MCPClient>>
     readonly tools: () => Effect.Effect<Record<string, Tool>>
+    readonly catalog: () => Effect.Effect<CatalogEntry[]>
+    readonly toolsWithLazy: (activatedToolIds: Set<string>) => Effect.Effect<Record<string, Tool>>
     readonly prompts: () => Effect.Effect<Record<string, PromptInfo & { client: string }>>
     readonly resources: () => Effect.Effect<Record<string, ResourceInfo & { client: string }>>
     readonly add: (name: string, mcp: Config.Mcp) => Effect.Effect<{ status: Record<string, Status> | Status }>
@@ -485,8 +498,11 @@ export namespace MCP {
             status: {},
             clients: {},
             defs: {},
+            modes: {},
           }
 
+          // Startup MCP connects are intentionally bounded and single-pass in v1.
+          // This lowers fan-out versus unbounded startup and avoids any retry loop within one startup lifecycle.
           yield* Effect.forEach(
             Object.entries(config),
             ([key, mcp]) =>
@@ -496,11 +512,16 @@ export namespace MCP {
                   return
                 }
 
-                if (mcp.enabled === false) {
+                const mode = Config.resolveMcpMode(mcp, key)
+                s.modes[key] = mode
+
+                if (mode === "disabled") {
                   s.status[key] = { status: "disabled" }
                   return
                 }
 
+                // V1: lazy servers still connect eagerly at startup; they just don't expose tools until activated.
+                // This is the documented "lazy exposure only" tradeoff.
                 const result = yield* create(key, mcp).pipe(Effect.catch(() => Effect.succeed(undefined)))
                 if (!result) return
 
@@ -511,7 +532,7 @@ export namespace MCP {
                   watch(s, key, result.mcpClient, mcp.timeout)
                 }
               }),
-            { concurrency: "unbounded" },
+            { concurrency: STARTUP_CONCURRENCY },
           )
 
           yield* Effect.addFinalizer(() =>
@@ -570,6 +591,13 @@ export namespace MCP {
 
       const createAndStore = Effect.fn("MCP.createAndStore")(function* (name: string, mcp: Config.Mcp) {
         const s = yield* InstanceState.get(state)
+        s.modes[name] = Config.resolveMcpMode(mcp, name)
+        if (s.modes[name] === "disabled") {
+          yield* closeClient(s, name)
+          delete s.clients[name]
+          s.status[name] = { status: "disabled" }
+          return s.status[name]
+        }
         const result = yield* create(name, mcp)
 
         s.status[name] = result.status
@@ -617,7 +645,7 @@ export namespace MCP {
         const defaultTimeout = cfg.experimental?.mcp_timeout
 
         const connectedClients = Object.entries(s.clients).filter(
-          ([clientName]) => s.status[clientName]?.status === "connected",
+          ([clientName]) => s.status[clientName]?.status === "connected" && s.modes[clientName] === "eager",
         )
 
         yield* Effect.forEach(
@@ -640,6 +668,103 @@ export namespace MCP {
             }),
           { concurrency: "unbounded" },
         )
+        return result
+      })
+
+      const toolsWithLazy = Effect.fn("MCP.toolsWithLazy")(function* (activatedToolIds: Set<string>) {
+        const result: Record<string, Tool> = {}
+        const s = yield* InstanceState.get(state)
+
+        const cfg = yield* cfgSvc.get()
+        const config = cfg.mcp ?? {}
+        const defaultTimeout = cfg.experimental?.mcp_timeout
+
+        // Eager servers
+        const eagerClients = Object.entries(s.clients).filter(
+          ([clientName]) => s.status[clientName]?.status === "connected" && s.modes[clientName] === "eager",
+        )
+
+        yield* Effect.forEach(
+          eagerClients,
+          ([clientName, client]) =>
+            Effect.gen(function* () {
+              const mcpConfig = config[clientName]
+              const entry = mcpConfig && isMcpConfigured(mcpConfig) ? mcpConfig : undefined
+
+              const listed = s.defs[clientName]
+              if (!listed) {
+                log.warn("missing cached tools for connected server", { clientName })
+                return
+              }
+
+              const timeout = entry?.timeout ?? defaultTimeout
+              for (const mcpTool of listed) {
+                const toolId = sanitize(clientName) + "_" + sanitize(mcpTool.name)
+                result[toolId] = convertMcpTool(mcpTool, client, timeout)
+              }
+            }),
+          { concurrency: "unbounded" },
+        )
+
+        // Lazy servers: include only activated tools
+        const lazyClients = Object.entries(s.clients).filter(
+          ([clientName]) => s.status[clientName]?.status === "connected" && s.modes[clientName] === "lazy",
+        )
+
+        yield* Effect.forEach(
+          lazyClients,
+          ([clientName, client]) =>
+            Effect.gen(function* () {
+              const mcpConfig = config[clientName]
+              const entry = mcpConfig && isMcpConfigured(mcpConfig) ? mcpConfig : undefined
+
+              const listed = s.defs[clientName]
+              if (!listed) {
+                log.warn("missing cached tools for connected lazy server", { clientName })
+                return
+              }
+
+              const timeout = entry?.timeout ?? defaultTimeout
+              for (const mcpTool of listed) {
+                const toolId = sanitize(clientName) + "_" + sanitize(mcpTool.name)
+                if (activatedToolIds.has(toolId)) {
+                  result[toolId] = convertMcpTool(mcpTool, client, timeout)
+                }
+              }
+            }),
+          { concurrency: "unbounded" },
+        )
+
+        return result
+      })
+
+      // V1 LAZY-LOADING TRADEOFF (documented in .weave/plans/lazy-mcp-loading.md):
+      // This is lazy EXPOSURE only, not lazy CONNECTION. Lazy servers still connect at startup
+      // so listTools() can build the catalog. Tools are hidden from MCP.tools() until activated per-session.
+      const catalog = Effect.fn("MCP.catalog")(function* () {
+        const result: CatalogEntry[] = []
+        const s = yield* InstanceState.get(state)
+
+        for (const [serverName, mode] of Object.entries(s.modes)) {
+          if (mode !== "lazy") continue
+          // OAuth / auth-required lazy servers only enter the catalog after they are connected.
+          // If auth has not completed yet, they remain unavailable to the lazy discovery path.
+          if (s.status[serverName]?.status !== "connected") continue
+          const defs = s.defs[serverName]
+          if (!defs) continue
+
+          for (const tool of defs) {
+            const toolId = sanitize(serverName) + "_" + sanitize(tool.name)
+            result.push({
+              server: serverName,
+              toolName: tool.name,
+              toolId,
+              description: tool.description ?? "",
+              loaded: false,
+            })
+          }
+        }
+
         return result
       })
 
@@ -853,6 +978,8 @@ export namespace MCP {
         status,
         clients,
         tools,
+        catalog,
+        toolsWithLazy,
         prompts,
         resources,
         add,
@@ -890,6 +1017,11 @@ export namespace MCP {
   export const status = async () => runPromise((svc) => svc.status())
 
   export const tools = async () => runPromise((svc) => svc.tools())
+
+  export const catalog = async () => runPromise((svc) => svc.catalog())
+
+  export const toolsWithLazy = async (activatedToolIds: Set<string>) =>
+    runPromise((svc) => svc.toolsWithLazy(activatedToolIds))
 
   export const prompts = async () => runPromise((svc) => svc.prompts())
 

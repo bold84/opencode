@@ -95,6 +95,11 @@ export class McpOAuthProvider implements OAuthClientProvider {
     // Use getForUrl to validate tokens are for the current server URL
     const entry = await McpAuth.getForUrl(this.mcpName, this.serverUrl)
     if (!entry?.tokens) return undefined
+    if (await McpAuth.isTokenExpired(this.mcpName)) {
+      log.info("stored oauth token expired, clearing tokens", { mcpName: this.mcpName })
+      await this.invalidateCredentials("tokens")
+      return undefined
+    }
 
     return {
       access_token: entry.tokens.accessToken,

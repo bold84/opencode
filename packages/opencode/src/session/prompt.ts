@@ -9,7 +9,7 @@ import { Session } from "."
 import { Agent } from "../agent/agent"
 import { Provider } from "../provider/provider"
 import { ModelID, ProviderID } from "../provider/schema"
-import { type Tool as AITool, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
+import { type Tool as AITool, tool, dynamicTool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
 import { SessionCompaction } from "./compaction"
 import { Instance } from "../project/instance"
 import { Bus } from "../bus"
@@ -63,6 +63,10 @@ IMPORTANT:
 - This tool provides your final answer - no further actions are taken after calling it`
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
+const MCP_NAME = /^[a-zA-Z0-9_-]{1,128}$/
+const MCP_SEARCH_LIMIT = 20
+const MCP_LOAD_LIMIT = 10
+const MCP_QUERY_LIMIT = 200
 
 export namespace SessionPrompt {
   const log = Log.create({ service: "session.prompt" })
@@ -70,6 +74,9 @@ export namespace SessionPrompt {
   export interface Interface {
     readonly assertNotBusy: (sessionID: SessionID) => Effect.Effect<void, Session.BusyError>
     readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+    readonly activateMcpTools: (sessionID: SessionID, tools: string[]) => Effect.Effect<string[]>
+    readonly activeMcpTools: (sessionID: SessionID) => Effect.Effect<string[]>
+    readonly consumeMcpRate: (sessionID: SessionID, action: "search" | "load") => Effect.Effect<boolean>
     readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
     readonly loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts>
     readonly shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts>
@@ -105,15 +112,65 @@ export namespace SessionPrompt {
       const state = yield* InstanceState.make(
         Effect.fn("SessionPrompt.state")(function* () {
           const runners = new Map<string, Runner<MessageV2.WithParts>>()
+          const mcpTools = new Map<string, Set<string>>()
+          const mcpRate = new Map<
+            string,
+            { search: { count: number; reset: number }; load: { count: number; reset: number } }
+          >()
           yield* Effect.addFinalizer(
             Effect.fnUntraced(function* () {
               yield* Effect.forEach(runners.values(), (r) => r.cancel, { concurrency: "unbounded", discard: true })
               runners.clear()
+              mcpTools.clear()
+              mcpRate.clear()
             }),
           )
-          return { runners }
+          return { runners, mcpTools, mcpRate }
         }),
       )
+
+      const clearMcpState = Effect.fn("SessionPrompt.clearMcpState")(function* (sessionID: SessionID) {
+        const s = yield* InstanceState.get(state)
+        s.mcpTools.delete(sessionID)
+        s.mcpRate.delete(sessionID)
+      })
+
+      const mcpRate = Effect.fn("SessionPrompt.mcpRate")(function* (sessionID: SessionID, action: "search" | "load") {
+        const s = yield* InstanceState.get(state)
+        const now = Date.now()
+        const limit = action === "search" ? 30 : 10
+        const reset = now + 60_000
+        const item = s.mcpRate.get(sessionID) ?? {
+          search: { count: 0, reset },
+          load: { count: 0, reset },
+        }
+        const next = item[action].reset <= now ? { count: 0, reset } : item[action]
+        if (next.count >= limit) {
+          s.mcpRate.set(sessionID, { ...item, [action]: next })
+          return false
+        }
+        s.mcpRate.set(sessionID, {
+          ...item,
+          [action]: { count: next.count + 1, reset: next.reset },
+        })
+        return true
+      })
+
+      const activateMcpTools = Effect.fn("SessionPrompt.activateMcpTools")(function* (
+        sessionID: SessionID,
+        tools: string[],
+      ) {
+        const s = yield* InstanceState.get(state)
+        const item = s.mcpTools.get(sessionID) ?? new Set<string>()
+        tools.forEach((tool) => item.add(tool))
+        s.mcpTools.set(sessionID, item)
+        return Array.from(item)
+      })
+
+      const activeMcpTools = Effect.fn("SessionPrompt.activeMcpTools")(function* (sessionID: SessionID) {
+        const s = yield* InstanceState.get(state)
+        return Array.from(s.mcpTools.get(sessionID) ?? [])
+      })
 
       const getRunner = (runners: Map<string, Runner<MessageV2.WithParts>>, sessionID: SessionID) => {
         const existing = runners.get(sessionID)
@@ -124,7 +181,10 @@ export namespace SessionPrompt {
             yield* status.set(sessionID, { type: "idle" })
           }),
           onBusy: status.set(sessionID, { type: "busy" }),
-          onInterrupt: lastAssistant(sessionID),
+          onInterrupt: Effect.gen(function* () {
+            yield* clearMcpState(sessionID)
+            return yield* lastAssistant(sessionID)
+          }),
           busy: () => {
             throw new Session.BusyError(sessionID)
           },
@@ -146,6 +206,7 @@ export namespace SessionPrompt {
         const s = yield* InstanceState.get(state)
         const runner = s.runners.get(sessionID)
         if (!runner || !runner.busy) {
+          yield* clearMcpState(sessionID)
           yield* status.set(sessionID, { type: "idle" })
           return
         }
@@ -433,6 +494,194 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             ),
         })
 
+        const ruleset = Permission.merge(input.agent.permission, input.session.permission ?? [])
+        const visibleCatalog = Effect.fn("SessionPrompt.visibleCatalog")(function* (sessionID: SessionID) {
+          const loaded = new Set(yield* activeMcpTools(sessionID))
+          const all = (yield* mcp.catalog()).map((item) => ({ ...item, loaded: loaded.has(item.toolId) }))
+          const blocked = Permission.disabled(
+            all.map((item) => item.toolId),
+            ruleset,
+          )
+          return all.filter((item) => !blocked.has(item.toolId))
+        })
+
+        const mcpInput = z.object({
+          action: z.enum(["search", "describe", "load"]),
+          query: z.string().optional(),
+          server: z.string().optional(),
+          tools: z
+            .object({
+              server: z.string(),
+              name: z.string(),
+            })
+            .array()
+            .optional(),
+          limit: z.number().int().positive().optional(),
+        })
+
+        const catalog = yield* visibleCatalog(input.session.id)
+        if (catalog.length) {
+          tools.mcp = dynamicTool({
+            description:
+              "Search, describe, and load lazy MCP tools for this session. Use this before calling a lazy MCP tool directly.",
+            inputSchema: mcpInput,
+            execute(args, options) {
+              return Effect.runPromise(
+                Effect.gen(function* () {
+                  const ctx = context(args, options)
+                  const val = mcpInput.parse(args)
+                  const server = val.server?.trim()
+                  const query = val.query?.trim()
+                  const limit = Math.min(val.limit ?? 10, MCP_SEARCH_LIMIT)
+                  const current = yield* visibleCatalog(ctx.sessionID)
+                  const byName = (item: (typeof current)[number]) => {
+                    if (!query) return 0
+                    const q = query.toLowerCase()
+                    const name = item.toolName.toLowerCase()
+                    const desc = item.description.toLowerCase()
+                    const srv = item.server.toLowerCase()
+                    if (name === q) return 0
+                    if (name.startsWith(q)) return 1
+                    if (name.includes(q)) return 2
+                    if (desc.includes(q)) return 3
+                    if (srv.includes(q)) return 4
+                    return 5
+                  }
+
+                  if (server && !MCP_NAME.test(server)) {
+                    return {
+                      title: "",
+                      metadata: {},
+                      output: "Invalid MCP server selector.",
+                      content: [{ type: "text", text: "Invalid MCP server selector." }],
+                    }
+                  }
+
+                  if (val.action === "search" && (!query || !query.length || query.length > MCP_QUERY_LIMIT)) {
+                    return {
+                      title: "",
+                      metadata: {},
+                      output: "Search query must be between 1 and 200 characters.",
+                      content: [{ type: "text", text: "Search query must be between 1 and 200 characters." }],
+                    }
+                  }
+
+                  if ((val.tools ?? []).some((item) => !MCP_NAME.test(item.server) || !MCP_NAME.test(item.name))) {
+                    return {
+                      title: "",
+                      metadata: {},
+                      output: "Invalid MCP tool selector.",
+                      content: [{ type: "text", text: "Invalid MCP tool selector." }],
+                    }
+                  }
+
+                  if (val.action !== "describe") {
+                    const ok = yield* mcpRate(ctx.sessionID, val.action)
+                    if (!ok) {
+                      return {
+                        title: "",
+                        metadata: { rate_limited: true },
+                        output: `Too many MCP ${val.action} requests. Retry later.`,
+                        content: [{ type: "text", text: `Too many MCP ${val.action} requests. Retry later.` }],
+                      }
+                    }
+                  }
+
+                  const serverStatus = server ? (yield* mcp.status())[server] : undefined
+                  const scoped = server ? current.filter((item) => item.server === server) : current
+                  if (server && !scoped.length) {
+                    const text =
+                      serverStatus?.status === "needs_auth"
+                        ? "No lazy MCP tools are currently available for that server because it requires authentication. Authenticate the server first, then search again."
+                        : "No lazy MCP tools are currently available for that server. It may require authentication or may not expose lazy tools."
+                    return {
+                      title: "",
+                      metadata: {},
+                      output: text,
+                      content: [
+                        {
+                          type: "text",
+                          text,
+                        },
+                      ],
+                    }
+                  }
+                  if (val.action === "search") {
+                    const items = scoped
+                      .filter((item) => byName(item) < 5)
+                      .sort((a, b) => byName(a) - byName(b) || a.toolName.localeCompare(b.toolName))
+                      .slice(0, limit)
+                    const text = items.length
+                      ? items.map((item) => `${item.toolId}: ${item.description || item.toolName}`).join("\n")
+                      : "No matching lazy MCP tools found."
+                    return {
+                      title: "",
+                      metadata: { count: items.length },
+                      output: text,
+                      content: [{ type: "text", text }],
+                    }
+                  }
+
+                  if (val.action === "describe") {
+                    const items = val.tools?.length
+                      ? val.tools
+                          .filter((item) => MCP_NAME.test(item.server) && MCP_NAME.test(item.name))
+                          .flatMap((item) =>
+                            scoped.filter((entry) => entry.server === item.server && entry.toolName === item.name),
+                          )
+                      : query
+                        ? scoped
+                            .filter((item) => byName(item) < 5)
+                            .sort((a, b) => byName(a) - byName(b) || a.toolName.localeCompare(b.toolName))
+                            .slice(0, limit)
+                        : []
+                    const text = items.length
+                      ? items
+                          .map(
+                            (item) =>
+                              `${item.toolId}\nserver: ${item.server}\ntool: ${item.toolName}\nloaded: ${item.loaded ? "yes" : "no"}\ndescription: ${item.description || ""}`,
+                          )
+                          .join("\n\n")
+                      : "No matching lazy MCP tools found."
+                    return {
+                      title: "",
+                      metadata: { count: items.length },
+                      output: text,
+                      content: [{ type: "text", text }],
+                    }
+                  }
+
+                  const picks = Array.from(
+                    new Map(
+                      (val.tools ?? [])
+                        .filter((item) => MCP_NAME.test(item.server) && MCP_NAME.test(item.name))
+                        .slice(0, MCP_LOAD_LIMIT)
+                        .map((item) => {
+                          const found = scoped.find(
+                            (entry) => entry.server === item.server && entry.toolName === item.name,
+                          )
+                          return found ? [found.toolId, found.toolId] : undefined
+                        })
+                        .filter((item): item is [string, string] => Boolean(item)),
+                    ).values(),
+                  )
+                  if (!picks.length) {
+                    return {
+                      title: "",
+                      metadata: {},
+                      output: "No valid lazy MCP tools selected.",
+                      content: [{ type: "text", text: "No valid lazy MCP tools selected." }],
+                    }
+                  }
+                  const loaded = yield* activateMcpTools(ctx.sessionID, picks)
+                  const text = `Loaded ${picks.length} MCP tool${picks.length === 1 ? "" : "s"} for this session: ${picks.join(", ")}. Call the loaded tool directly next.`
+                  return { title: "", metadata: { loaded }, output: text, content: [{ type: "text", text }] }
+                }),
+              )
+            },
+          })
+        }
+
         for (const item of yield* registry.tools(
           { modelID: ModelID.make(input.model.api.id), providerID: input.model.providerID },
           input.agent,
@@ -473,7 +722,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           })
         }
 
-        for (const [key, item] of Object.entries(yield* mcp.tools())) {
+        const activated = new Set(yield* activeMcpTools(input.session.id))
+        for (const [key, item] of Object.entries(yield* mcp.toolsWithLazy(activated))) {
           const execute = item.execute
           if (!execute) continue
 
@@ -1498,13 +1748,44 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
                 yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
-                const [skills, env, instructions, modelMsgs] = yield* Effect.all([
+                const [skills, env, instructions, modelMsgs, lazyCatalog, loadedLazy] = yield* Effect.all([
                   Effect.promise(() => SystemPrompt.skills(agent)),
                   Effect.promise(() => SystemPrompt.environment(model)),
                   instruction.system().pipe(Effect.orDie),
                   Effect.promise(() => MessageV2.toModelMessages(msgs, model)),
+                  mcp.catalog().pipe(Effect.orElseSucceed(() => [])),
+                  activeMcpTools(sessionID),
                 ])
                 const system = [...env, ...(skills ? [skills] : []), ...instructions]
+                // Lazy MCP prompt index: compact, permission-filtered, bounded to 4 tools/server.
+                // This is the v1 "lazy exposure only" behavior documented in .weave/plans/lazy-mcp-loading.md.
+                const blocked = Permission.disabled(
+                  lazyCatalog.map((item) => item.toolId),
+                  Permission.merge(agent.permission, session.permission ?? []),
+                )
+                const visibleLazy = lazyCatalog.filter((item) => !blocked.has(item.toolId))
+                if (visibleLazy.length) {
+                  const loaded = new Set(loadedLazy)
+                  const grouped = Object.entries(Object.groupBy(visibleLazy, (item) => item.server))
+                    .map(([server, items]) => {
+                      const list = (items ?? []).slice(0, 4)
+                      const names = list
+                        .map((item) => `${item.toolName}${loaded.has(item.toolId) ? "*" : ""}`)
+                        .join(", ")
+                      return `- ${server}: ${items?.length ?? 0} tools${names ? ` (${names})` : ""}`
+                    })
+                    .join("\n")
+                  system.push(
+                    [
+                      "<mcp_servers>",
+                      "Lazy MCP tools are available but not yet exposed as callable tools.",
+                      "Use the mcp tool to search, describe, and load them for this session.",
+                      grouped,
+                      "Loaded tools are marked with *.",
+                      "</mcp_servers>",
+                    ].join("\n"),
+                  )
+                }
                 const format = lastUser.format ?? { type: "text" as const }
                 if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
                 const result = yield* handle.process({
@@ -1700,6 +1981,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return Service.of({
         assertNotBusy,
         cancel,
+        activateMcpTools,
+        activeMcpTools,
+        consumeMcpRate: mcpRate,
         prompt,
         loop,
         shell,
@@ -1816,6 +2100,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
   export async function cancel(sessionID: SessionID) {
     return runPromise((svc) => svc.cancel(SessionID.zod.parse(sessionID)))
+  }
+
+  export async function activateMcpTools(sessionID: SessionID, tools: string[]) {
+    return runPromise((svc) => svc.activateMcpTools(SessionID.zod.parse(sessionID), z.string().array().parse(tools)))
+  }
+
+  export async function activeMcpTools(sessionID: SessionID) {
+    return runPromise((svc) => svc.activeMcpTools(SessionID.zod.parse(sessionID)))
+  }
+
+  export async function consumeMcpRate(sessionID: SessionID, action: "search" | "load") {
+    return runPromise((svc) =>
+      svc.consumeMcpRate(SessionID.zod.parse(sessionID), z.enum(["search", "load"]).parse(action)),
+    )
   }
 
   export const LoopInput = z.object({

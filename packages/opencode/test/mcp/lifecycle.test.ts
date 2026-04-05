@@ -673,6 +673,50 @@ test(
   ),
 )
 
+test(
+  "tools() and catalog() separate eager lazy and disabled servers",
+  withInstance({}, async () => {
+    lastCreatedClientName = "eager-server"
+    getOrCreateClientState("eager-server").tools = [
+      { name: "eager_tool", description: "eager", inputSchema: { type: "object", properties: {} } },
+    ]
+    await MCP.add("eager-server", {
+      type: "local",
+      mode: "eager",
+      command: ["echo", "test"],
+    })
+
+    lastCreatedClientName = "lazy-server"
+    getOrCreateClientState("lazy-server").tools = [
+      { name: "lazy_tool", description: "lazy", inputSchema: { type: "object", properties: {} } },
+    ]
+    await MCP.add("lazy-server", {
+      type: "local",
+      mode: "lazy",
+      command: ["echo", "test"],
+    })
+
+    await MCP.add("disabled-server", {
+      type: "local",
+      mode: "disabled",
+      command: ["echo", "test"],
+    })
+
+    const eager = await MCP.tools()
+    expect(Object.keys(eager).some((key) => key.includes("eager_tool"))).toBe(true)
+    expect(Object.keys(eager).some((key) => key.includes("lazy_tool"))).toBe(false)
+    expect(Object.keys(eager).some((key) => key.includes("disabled"))).toBe(false)
+
+    const catalog = await MCP.catalog()
+    expect(catalog.map((item: { toolId: string }) => item.toolId)).toContain("lazy-server_lazy_tool")
+    expect(catalog.map((item: { toolId: string }) => item.toolId)).not.toContain("eager-server_eager_tool")
+
+    const mixed = await MCP.toolsWithLazy(new Set(["lazy-server_lazy_tool"]))
+    expect(Object.keys(mixed)).toContain("eager-server_eager_tool")
+    expect(Object.keys(mixed)).toContain("lazy-server_lazy_tool")
+  }),
+)
+
 // ========================================================================
 // Test: transport leak — local stdio timeout (#19168)
 // ========================================================================

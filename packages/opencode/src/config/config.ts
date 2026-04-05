@@ -379,6 +379,10 @@ export namespace Config {
         .optional()
         .describe("Environment variables to set when running the MCP server"),
       enabled: z.boolean().optional().describe("Enable or disable the MCP server on startup"),
+      mode: z
+        .enum(["eager", "lazy", "disabled"])
+        .optional()
+        .describe("MCP server loading mode: eager (load at startup), lazy (discoverable on-demand), disabled (off)"),
       timeout: z
         .number()
         .int()
@@ -411,6 +415,10 @@ export namespace Config {
       type: z.literal("remote").describe("Type of MCP server connection"),
       url: z.string().describe("URL of the remote MCP server"),
       enabled: z.boolean().optional().describe("Enable or disable the MCP server on startup"),
+      mode: z
+        .enum(["eager", "lazy", "disabled"])
+        .optional()
+        .describe("MCP server loading mode: eager (load at startup), lazy (discoverable on-demand), disabled (off)"),
       headers: z.record(z.string(), z.string()).optional().describe("Headers to send with the request"),
       oauth: z
         .union([McpOAuth, z.literal(false)])
@@ -432,6 +440,32 @@ export namespace Config {
 
   export const Mcp = z.discriminatedUnion("type", [McpLocal, McpRemote])
   export type Mcp = z.infer<typeof Mcp>
+
+  /**
+   * Resolve final MCP server mode from config.
+   * Precedence: explicit `mode` wins; otherwise `enabled === false` → "disabled"; otherwise "eager".
+   * When both `mode` and `enabled` are present and disagree, `mode` is kept and a warning is logged.
+   */
+  export function resolveMcpMode(mcp: Mcp, serverName: string): "eager" | "lazy" | "disabled" {
+    const explicitMode = mcp.mode
+    const enabledFlag = mcp.enabled
+
+    if (explicitMode) {
+      if (enabledFlag !== undefined && enabledFlag === false && explicitMode !== "disabled") {
+        // Conflict: mode says non-disabled but enabled=false. Keep mode, warn.
+        console.warn(
+          `[config] MCP '${serverName}': 'mode' (${explicitMode}) conflicts with 'enabled=false'. Using mode='${explicitMode}'.`,
+        )
+      }
+      return explicitMode
+    }
+
+    if (enabledFlag === false) {
+      return "disabled"
+    }
+
+    return "eager"
+  }
 
   export const PermissionAction = z.enum(["ask", "allow", "deny"]).meta({
     ref: "PermissionActionConfig",

@@ -31,6 +31,10 @@ export namespace McpAuth {
   })
   export type Entry = z.infer<typeof Entry>
 
+  // SECURITY NOTE (residual risk, outside lazy-MCP scope):
+  // OAuth tokens and client secrets are stored in plaintext JSON at this path with 0o600 permissions.
+  // This protects against other users on multi-user systems but does not encrypt at rest.
+  // Future improvement: integrate with platform credential stores (macOS Keychain, Windows Credential Manager, etc.).
   const filepath = path.join(Global.Path.data, "mcp-auth.json")
 
   export interface Interface {
@@ -170,4 +174,6 @@ export namespace McpAuth {
 
   export const updateOAuthState = async (mcpName: string, oauthState: string) =>
     runPromise((svc) => svc.updateOAuthState(mcpName, oauthState))
+
+  export const isTokenExpired = async (mcpName: string) => runPromise((svc) => svc.isTokenExpired(mcpName))
 }
